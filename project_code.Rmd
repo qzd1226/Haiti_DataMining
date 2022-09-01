@@ -1,0 +1,1044 @@
+---
+title: "Disaster Relief Project: Template"
+author: "Zongdi Qiu"
+date: "`r format(Sys.Date(), '%b %d, %Y')`"
+output:
+  html_document:
+    number_sections: true    
+    toc: true
+    toc_float: true
+    theme: cosmo
+    highlight: espresso    
+# You can make the format personal - this will get you started:  
+# https://bookdown.org/yihui/rmarkdown/html-document.html#appearance_and_style    
+---
+
+<!--- Below are global settings for knitr. You can override any of them by adding the changes to individual chunks --->
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(
+  error=TRUE,          # Keep compiling upon error
+  collapse=FALSE,      # collapse by default
+  echo=TRUE,           # echo code by default
+  comment = "#>",      # change comment character
+  fig.width = 5.5,     # set figure width
+  fig.align = "center",# set figure position
+  out.width = "49%",   # set width of displayed images
+  warning=TRUE,        # show R warnings
+  message=TRUE         # show R messages
+)
+```
+
+<!--- Change font sizes (or other css modifications) --->
+
+```{=html}
+<style>
+h1.title {
+  font-size: 2.2em; /* Title font size */
+}
+h1 {
+  font-size: 2em;   /* Header 1 font size */
+}
+h2 {
+  font-size: 1.5em;
+}
+h3 { 
+  font-size: 1.2em;
+}
+pre {
+  font-size: 0.8em;  /* Code and R output font size */
+}
+</style>
+```
+**SYS 6018 \| Spring 2022 \| University of Virginia**
+
+------------------------------------------------------------------------
+
+# Introduction
+
+During the 2010 Earthquake in Haiti, many people lost their homes. These homeless people generally live under blue TARP. Our task was to train the model to quickly locate these homeless people in aerial images, in other words to locate blue Tarp.When we know where the homeless are, we can deploy our resources more effectively. More accurate estimates of the number of people affected. Aerial images are RGB three-channel images, and each sample is a pixel point. In the data, the classification of each sample has been marked, so I use supervised learning methods.
+
+# Training Data / EDA
+
+Load data, explore data, etc.
+
+```{r load-packages, warning=FALSE, message=FALSE}
+# Load Required Packages
+library(tidyverse)
+library(glmnet)
+library(yardstick)
+library(broom)
+library(plotly)
+library(nnet)
+library(e1071)  # functions for svm
+library(pROC) # functions for AUROC
+library(naivebayes) # package for naivebayes
+library(caret)
+library(MASS) # package for lda and qda
+library(purrr) # package for thresholds searching
+library(randomForest) # package for randomforest
+library(gbm) # package for gbm
+#-- Load Data and add binary outcome
+data = read_csv('HaitiTraining.csv') %>%
+mutate(bluetarp = ifelse(Class == 'Blue Tarp', 1L, 0L) %>% factor())
+
+#-- EDA & Explore data
+head(data,n=50)
+ggplot(data) + 
+  geom_bar(mapping = aes(x = Class))
+plot_ly(x=data$Red, y=data$Green, z=data$Blue, type="scatter3d", mode="markers", color=data$Class) %>% layout(autosize = F, width = 500, height = 500)
+#-- The ratio of bluetarp and non-bluetarp
+ggplot(data) + 
+  geom_bar(mapping = aes(x = bluetarp))
+plot_ly(x=data$Red, y=data$Green, z=data$Blue, type="scatter3d", mode="markers", color=data$bluetarp) %>% layout(autosize = F, width = 500, height = 500)
+
+#-- Make function to calculate confusion matrix metrics
+get_conf <- function(thres, y, p_hat) {
+yhat = ifelse(p_hat >= thres, 1L, 0L)
+tibble(threshold = thres,
+TP = sum(y == 1 & yhat == 1),
+FP = sum(y == 0 & yhat == 1),
+FN = sum(y == 1 & yhat == 0),
+TN = sum(y == 0 & yhat == 0)
+)
+}
+
+```
+
+# Model Training
+
+## Set up cross-validation folds
+
+```{r set-up, warning=FALSE, message=FALSE}
+set.seed(2021)
+nfolds = 10 # number of folds
+n= nrow(data) # number of observations in training dataset
+folds = sample(rep(1:nfolds, length = n))
+train_control <- trainControl(
+  method = "cv", 
+  number = nfolds
+  )
+```
+
+## Naive Bayes
+
+### Tuning Parameter usekernel,adjust,fL
+There are three hyperparameters in naive bayes model usekernel: parameter allows us to use a kernel density estimate for continuous variables versus a guassian density estimate, adjust: allows us to adjust the bandwidth of the kernel density (larger numbers mean more flexible density estimate), fL: allows us to incorporate the Laplace smoother.
+```{r Naive_Bayes_Tunning_Parameter, warning=FALSE, message=FALSE}
+
+# set up tuning grid
+search_grid <- expand.grid(
+usekernel = c(TRUE, FALSE),
+fL = 0:5,
+adjust = seq(0, 5, by = 1)
+)
+
+# train model
+model <- train(
+x = data[c("Red","Green","Blue")],
+y = data$bluetarp,
+method = "nb",
+trControl = train_control,
+tuneGrid = search_grid
+)
+# top 5 modesl
+model$results %>%
+top_n(50, wt = Accuracy) %>%
+arrange(desc(Accuracy))
+# plot search grid results
+plot(model)
+Naive_Bayes_Model <- model
+```
+### Best Model of Naive Bayes
+
+```{r Naive_Bayes_Best_Model, warning=FALSE, message=FALSE}
+NB_Prediction = predict(Naive_Bayes_Model,newdata= data[c("Red","Green","Blue")])
+nb.cm = table(NB_Prediction, data$bluetarp)
+nb.cm
+FP = nb.cm[1,2]
+FN = nb.cm[2,1]
+TP = nb.cm[2,2]
+TN = nb.cm[1,1]
+#get the accuracy precision FPR and FPR
+nb.acc = (TP + TN)/(FP + FN + TP + TN)
+nb.pre =  TP/(TP + FP)
+nb.tpr = TP/(TP+FN)
+nb.fpr = FP/(FP + TN)
+nb.auc = auc(as.numeric(data$bluetarp), as.numeric(NB_Prediction))
+nb.pre = NB_Prediction
+```
+
+## LDA
+
+```{r LDA, warning=FALSE, message=FALSE}
+LDA_Model <- lda(bluetarp ~ Red + Green + Blue, data = data)
+LDA_Prediction = predict(LDA_Model,newdata= data[c("Red","Green","Blue")])
+plot(LDA_Model)
+LDA_yhat <- LDA_Prediction$class
+lda.cm = table(LDA_yhat, data$bluetarp)
+print(lda.cm)
+FP = lda.cm[1,2]
+FN = lda.cm[2,1]
+TP = lda.cm[2,2]
+TN = lda.cm[1,1]
+#get the accuracy precision FPR and FPR
+lda.acc = (TP + TN)/(FP + FN + TP + TN)
+lda.pre =  TP/(TP + FP)
+lda.tpr = TP/(TP+FN)
+lda.fpr = FP/(FP + TN)
+lda.auc = auc(as.numeric(data$bluetarp), as.numeric(LDA_Prediction$class))
+```
+
+## QDA
+
+```{r QDA, warning=FALSE, message=FALSE}
+QDA_Model <- qda(bluetarp ~ Red + Green + Blue, data = data)
+QDA_Prediction = predict(QDA_Model,newdata= data[c("Red","Green","Blue")])
+QDA_yhat <- QDA_Prediction$class
+qda.cm = table(QDA_yhat, data$bluetarp)
+print(qda.cm)
+FP = qda.cm[1,2]
+FN = qda.cm[2,1]
+TP = qda.cm[2,2]
+TN = qda.cm[1,1]
+#get the accuracy precision FPR and FPR
+qda.acc = (TP + TN)/(FP + FN + TP + TN)
+qda.pre =  TP/(TP + FP)
+qda.tpr = TP/(TP+FN)
+qda.fpr = FP/(FP + TN)
+qda.auc = auc(as.numeric(data$bluetarp), as.numeric(LDA_Prediction$class))
+```
+
+## Logistic Regression
+
+## KNN
+
+First I'm going to train the KNN model. KNN(k nearest neighbor) is one of the simplest machine learning method. For each data point that needs to be predicted, KNN will look for k sample points closest to it and obtain the classification of prediction points by counting the class of K neighbor sample points. The distance between different sample is depand on their euclidean distance. K is the tuning parameter in this model.It determines the degree of freedom of the model, and as K increases the degree of freedom of the model decreases. \### Tuning Parameter $k$
+
+```{r KNN_Tuning_Parameter), warning=FALSE, message=FALSE}
+trControl <- trainControl(method  = "cv",
+                          number  = 5)
+KNN_Model <- train(bluetarp ~ .,
+             method     = "knn",
+             tuneGrid   = expand.grid(k = 1:20),
+             trControl  = trControl,
+             metric     = "Accuracy",
+             data       =  data[c("Red","Green","Blue","bluetarp")])
+print(KNN_Model)
+plot(KNN_Model)
+```
+
+k = 5 is the best parameters for this knn model.
+
+### Train the Best KNN Model
+
+```{r Best_KNN_Model), warning=FALSE, message=FALSE}
+KNN_Model <- FNN::knn(train = scale(data[c("Red","Green","Blue")]), 
+                test  = scale(data[c("Red","Green","Blue")]),
+                cl    = data$bluetarp,
+                k     = 5,
+                prob  = TRUE)
+ 
+ ##create confusion matrix
+knn.cm <- table(KNN_Model, data$bluetarp)
+print(knn.cm)
+FP = knn.cm[1,2]
+FN = knn.cm[2,1]
+TP = knn.cm[2,2]
+TN = knn.cm[1,1]
+#get the accuracy precision FPR and FPR
+knn.acc = (TP + TN)/(FP + FN + TP + TN)
+knn.pre =  TP/(TP + FP)
+knn.tpr = TP/(TP+FN)
+knn.fpr = FP/(FP + TN)
+knn.auc = auc(as.numeric(data$bluetarp), as.numeric(KNN_Model))
+
+```
+
+### Tuning Parameters
+
+## Support Vector Machines (SVM)
+
+### Tuning Parameters
+
+```{r SVM_Tuning_Parameters, warning=FALSE, message=FALSE}
+#- Set tuning parameter grid search
+grid = expand_grid(
+kernel = "radial",
+gamma = seq(1/8, 2, length=4),
+cost = 10^seq(-2,5,length=4)
+)
+#- Iterate over folds
+perf = tibble() # to save performance metric
+for(i in 1:3){ # NOTE: using 3 folds
+#-- Set training/test data for fold i
+test = which(folds == i) # indices of holdout/validation data
+train = which(folds != i) # indices of fitting/training data
+n.val = length(test) # number of observations in validation
+#-- loop over tuning grid
+for(j in 1:nrow(grid)){
+tpars = grid[j,]
+#: fit model (i.e., estimate model parameters)
+fit = e1071::svm(bluetarp ~ Red + Green + Blue,
+data = data[train,],
+type = "C-classification",
+probability=TRUE, # enable probability output
+#: tuning parameters
+scale = TRUE,
+kernel = tpars$kernel,
+gamma = tpars$gamma,
+cost = tpars$cost)
+#: estimate probability in hold out set
+p_hat = predict(fit, data[test,], probability = TRUE) %>%
+attr("probabilities") %>% .[,"1"]
+#: evaluate performance
+log_loss = yardstick::mn_log_loss_vec(data$bluetarp[test], p_hat,
+event_level = "second")
+AUROC = yardstick::roc_auc_vec(data$bluetarp[test], p_hat,
+event_level = "second")
+eval = tibble(log_loss, AUROC) %>%
+mutate(fold = i, tuning = j,
+n.val,
+kernel=tpars$kernel,
+gamma=tpars$gamma,
+cost=tpars$cost)
+#: update results
+perf = bind_rows(perf, eval)
+}
+}
+perf
+(avg_perf = perf %>%
+group_by(tuning, kernel, gamma, cost) %>%
+summarize(
+avg_log_loss = mean(log_loss),
+avg_AUROC = mean(AUROC),
+sd_log_loss = sd(log_loss),
+sd_AUROC = sd(AUROC)
+) %>%
+arrange(avg_log_loss, -avg_AUROC))
+ggplot(avg_perf, aes(gamma, cost, fill=avg_log_loss)) +
+geom_tile() + scale_y_log10() +
+scale_fill_distiller()
+tune_svm = list(cost = 400, gamma = 2, kernel = "radial")
+```
+
+### SVM final Model
+
+```{r SVM_Final_Model, warning=FALSE, message=FALSE}
+pred = numeric(nrow(data))
+for(v in unique(folds)) {
+# set fit/eval split
+ind_fit = which(folds != v)
+ind_eval = which(folds == v)
+# fit SVM (for specific tuning parameters)
+fit= e1071::svm(bluetarp ~ Red + Green + Blue,
+data = data[ind_fit,],
+type = "C-classification",
+probability=TRUE, # enable probability output
+#: tuning parameters
+scale = TRUE,
+kernel = tune_svm$kernel,
+gamma = tune_svm$gamma,
+cost = tune_svm$cost)
+# estimate probability in hold out set
+pred[ind_eval] = predict(fit, data[ind_eval,], probability = TRUE) %>%
+attr("probabilities") %>% .[,"1"]
+}
+eval_data = tibble(
+y = data$bluetarp,
+pred = pred,
+yhat = ifelse(pred > .50, 1, 0) # hard classification
+)
+yhat = ifelse(pred > .50, 1, 0) # hard classification
+SVM.predict = yhat
+# ROC curves
+ROC_data = yardstick::roc_curve(eval_data,
+truth = y,
+estimate = pred,
+event_level = "second")
+autoplot(ROC_data)
+
+svm.cm <- table(SVM.predict, data$bluetarp)
+print(svm.cm)
+FP = svm.cm[1,2]
+FN = svm.cm[2,1]
+TP = svm.cm[2,2]
+TN = svm.cm[1,1]
+#get the accuracy precision FPR and FPR
+svm.acc = (TP + TN)/(FP + FN + TP + TN)
+svm.pre =  TP/(TP + FP)
+svm.tpr = TP/(TP+FN)
+svm.fpr = FP/(FP + TN)
+svm.auc = auc(as.numeric(data$bluetarp), as.numeric(RF_Prediction))
+```
+
+## Random Forest
+
+### Tuning Parameters Max_Tree, mtry
+
+```{r RF_TP, warning=FALSE, message=FALSE}
+#-- Settings
+ntree_max = 200            # maximum number of trees in forest
+mtry_seq = seq(1, 3 , by=1)  # grid of tuning parameters
+#-- cv
+ACC = tibble()               # initiate results df
+#-- Run cross-validation
+sumTest <- c()
+sumYhat <- c()
+  for(i in 1:length(mtry_seq)) {
+    acc <- c()
+     rf = randomForest(bluetarp ~ ., data= data[c("Red","Green","Blue","bluetarp")]
+                       , ntree = ntree_max, mtry = mtry_seq[i], cv.folds = 10) 
+    out = tibble(mtry = mtry_seq[i], 
+           ntree = 1:ntree_max, 
+           acc = rf$err.rate)
+    ACC = bind_rows(ACC, out)
+  }
+#-- Aggregate Results
+ACC_agg = ACC %>% 
+  group_by(mtry, ntree) %>% summarize(acc = 1 - mean(acc)) %>% ungroup()
+ACC_agg %>% 
+  mutate(mtry = factor(mtry)) %>%   # make mtry factor for plotting
+  ggplot(aes(ntree, acc, color=mtry)) + geom_line() + 
+  coord_cartesian(ylim=c(0.95, 0.999))
+RF_Tuning <- subset(ACC_agg, acc == max(acc))
+print(RF_Tuning)
+```
+
+### Train the Final RF Model with the Opt Parameter
+
+```{r Final_RF, warning=FALSE, message=FALSE}
+optNtree = RF_Tuning$ntree
+optMtry = RF_Tuning$mtry
+RF_Model = randomForest(bluetarp ~ ., data= data[c("Red","Green","Blue","bluetarp")]
+                       , ntree = optNtree, mtry = optMtry, cv.folds = 10) 
+RF_Prediction = predict(RF_Model,data = data[c("Red","Green","Blue")])
+rf.cm <- table(RF_Prediction, data$bluetarp)
+print(rf.cm)
+FP = rf.cm[1,2]
+FN = rf.cm[2,1]
+TP = rf.cm[2,2]
+TN = rf.cm[1,1]
+#get the accuracy precision FPR and FPR
+rf.acc = (TP + TN)/(FP + FN + TP + TN)
+rf.pre =  TP/(TP + FP)
+rf.tpr = TP/(TP+FN)
+rf.fpr = FP/(FP + TN)
+rf.auc = auc(as.numeric(data$bluetarp), as.numeric(RF_Prediction))
+
+```
+
+## Boost Tree
+
+### Tuning Paremeter
+
+```{r BoostTree_TP, warning=FALSE, message=FALSE}
+#-- Settings
+ntree_max = 200           # maximum number of trees in forest
+depth.seq = seq(1, 10 , by=1)  # grid of tuning parameters
+ACC.Boost = tibble()               # initiate results df
+phat<-c()
+K = 10
+#-- k fold cv
+for(k in 1:K) {
+  test = (folds == k)
+  train = (folds != k)
+  for(i in 1:length(depth.seq)) {
+    model.boost = gbm(as.character(bluetarp)~., data=data[train,c("Red","Green","Blue","bluetarp")], distribution ="bernoulli", n.trees=ntree_max, interaction.depth = depth.seq[i])
+    mse <- c()
+    for(j in 1:ntree_max){
+      phat <- c()
+      phat <- predict(model.boost, newdata =  data[test,c("Red","Green","Blue")], n.trees = j,type="response")
+      #yhat = ifelse(phat >= 0.2, 1L, 0L)
+      tmse = sum((as.numeric(phat) - as.numeric(data[test,]$bluetarp))^2)/length(phat)
+      #get the mse of each ntree and fold
+      mse = c(mse,tmse)
+    }
+    t <- model.boost$train.error
+    out = tibble(depth = depth.seq[i], 
+           ntree = 1:ntree_max, 
+           mse = mse, 
+           iter = k)
+            ACC.Boost = bind_rows(ACC.Boost, out)
+  }
+}
+
+#-- Aggregate Results
+ACC_agg.boost = ACC.Boost %>% 
+  group_by(depth, ntree) %>% summarize(mse = mean(mse)) %>% ungroup()
+
+#-- Plot Results
+ACC_agg.boost %>% 
+  mutate(depth = factor(depth)) %>%   # make depth factor for plotting
+  ggplot(aes(ntree, mse, color=depth)) + geom_line()
+BT_Tuning <- subset(ACC_agg.boost, mse == min(mse))
+print(BT_Tuning)
+optDepth = BT_Tuning$depth
+optNtree = BT_Tuning$ntree
+```
+
+### Train the Final Model with Optimal parameters
+
+```{r Train_Boost_Model, warning=FALSE, message=FALSE}
+Boost_Model =  gbm(as.character(bluetarp)~., data=data[c("Red","Green","Blue","bluetarp")], distribution ="bernoulli", n.trees=optNtree, interaction.depth = optDepth)
+Boost.predict = predict(Boost_Model,data, type="response")
+
+
+
+
+```
+
+### Threshold Selection
+
+```{r BoostTree_Threshold_Section, warning=FALSE, message=FALSE}
+#-- Calculate for range of thresholds
+thres = seq(0.01, 1, length=20) # set of thresholds
+perf_thres = map_df(thres, ~get_conf(., y=data$bluetarp, p_hat = Boost.predict)) %>%
+mutate(cost = FN*1 + FP*1)
+perf_thres
+#-- Make cost curve plot
+perf_thres %>%
+ggplot(aes(threshold, cost)) +
+geom_line() +
+geom_point() + geom_point(data = . %>% slice_min(cost), color="red", size=4) +
+geom_vline(xintercept = 1/6, color="red") +
+scale_x_continuous(breaks = seq(0, 1, by=.02))
+Boost_opt_threshold = 0.1
+
+```
+
+### Evaluate Boost Tree
+
+```{r BoostEvaluate, warning=FALSE, message=FALSE}
+yhat = ifelse(Boost.predict >= Boost_opt_threshold, 1L, 0L)
+bt.cm <- table(yhat, data$bluetarp)
+print(bt.cm)
+FP = bt.cm[1,2]
+FN = bt.cm[2,1]
+TP = bt.cm[2,2]
+TN = bt.cm[1,1]
+#get the accuracy precision FPR and FPR
+bt.acc = (TP + TN)/(FP + FN + TP + TN)
+bt.pre =  TP/(TP + FP)
+bt.tpr = TP/(TP+FN)
+bt.fpr = FP/(FP + TN)
+bt.auc = auc(as.numeric(data$bluetarp), as.numeric(yhat))
+
+
+```
+
+## Penalized Logistic Regression (ElasticNet)
+
+In this part I refer to the answers in the homework.The elasticnet models have two tuning parameters, α and λ. Once α is selected, then the glmnet() function can efficiently fit the models for a set of λ values. \### Tuning Parameters
+
+```{r ENet_Tuning, warning=FALSE, message=FALSE}
+#-- Initialize
+alpha_seq = c(0, .25, .5, .75, 1) # set of alpha values to search
+perf_alpha = tibble()
+#-- Search over alpha (and lambda)
+for(i in seq_along(alpha_seq)){
+a = alpha_seq[i]
+fit = cv.glmnet(x = as.matrix(data[c("Red","Green","Blue")]), y = data$bluetarp, family="binomial", alpha = a,
+foldid = folds, # use same folds for all alpha
+type.measure = "deviance")
+perf = broom::tidy(fit) %>% slice_min(estimate) %>% mutate(alpha = a)
+perf_alpha = bind_rows(perf_alpha, perf)
+}
+perf_alpha %>%
+ggplot(aes(alpha, estimate)) + geom_point() +
+geom_errorbar(aes(ymin=conf.low, ymax=conf.high), width=.05)
+perf_alpha %>% arrange(estimate) %>%
+mutate_at(vars(estimate:conf.high), round, digits=3)
+
+tune_enet = perf_alpha %>%
+slice_min(estimate)
+tune_enet
+```
+
+### Evaluate the Penalized Logistic Regression with Optimal Parameters
+
+```{r Evaluate_Enet, warning=FALSE, message=FALSE}
+Enet_Model = cv.glmnet(x = as.matrix(data[c("Red","Green","Blue")]), y = data$bluetarp, family="binomial", alpha = tune_enet$alpha,
+foldid = folds, # use same folds for all alpha
+type.measure = "deviance")
+
+Enet.predict = predict(Enet_Model,newx = as.matrix(data[c("Red","Green","Blue")]), type="response")
+#-- Calculate for range of thresholds
+thres = seq(0.01, 1, length=20) # set of thresholds
+perf_thres = map_df(thres, ~get_conf(., y=data$bluetarp, p_hat = Enet.predict)) %>%
+mutate(cost = FN*1 + FP*1)
+perf_thres
+#-- Make cost curve plot
+perf_thres %>%
+ggplot(aes(threshold, cost)) +
+geom_line() +
+geom_point() + geom_point(data = . %>% slice_min(cost), color="red", size=4) +
+scale_x_continuous(breaks = seq(0, 1, by=.02))
+Enet.optThreshold = 0.27052632
+#evaluation
+yhat = ifelse(Enet.predict >= Enet.optThreshold, 1L, 0L)
+Enet.cm <- table(yhat, data$bluetarp)
+print(Enet.cm)
+FP = Enet.cm[1,2]
+FN = Enet.cm[2,1]
+TP = Enet.cm[2,2]
+TN = Enet.cm[1,1]
+#get the accuracy precision FPR and FPR
+Enet.acc = (TP + TN)/(FP + FN + TP + TN)
+Enet.pre =  TP/(TP + FP)
+Enet.tpr = TP/(TP+FN)
+Enet.fpr = FP/(FP + TN)
+Enet.auc = auc(as.numeric(data$bluetarp), as.numeric(yhat))
+
+```
+
+## Logistic Regression
+
+### Training the Model
+
+```{r Train_Logistic_Regression_Model, warning=FALSE, message=FALSE}
+LR_model = cv.glmnet(x = as.matrix(data[c("Red","Green","Blue")]), y = data$bluetarp, family="binomial", alpha = 0,
+foldid = folds, # use same folds for all alpha
+type.measure = "deviance")
+
+
+```
+
+### Finding the Threshold
+
+```{r Finding_the_Threshold_LR, warning=FALSE, message=FALSE}
+LR.predict = predict(LR_model,newx = as.matrix(data[c("Red","Green","Blue")]), type="response")
+#-- Calculate for range of thresholds
+thres = seq(0.01, 1, length=20) # set of thresholds
+perf_thres = map_df(thres, ~get_conf(., y=data$bluetarp, p_hat = LR.predict)) %>%
+mutate(cost = FN*1 + FP*1)
+perf_thres
+#-- Make cost curve plot
+perf_thres %>%
+ggplot(aes(threshold, cost)) +
+geom_line() +
+geom_point() + geom_point(data = . %>% slice_min(cost), color="red", size=4) +
+scale_x_continuous(breaks = seq(0, 1, by=.02))
+LR.optThreshold = 0.27052632
+```
+
+### Evaluate the Logistic Regression Model
+
+```{r LR_Evaluation, warning=FALSE, message=FALSE}
+yhat = ifelse(LR.predict >= LR.optThreshold, 1L, 0L)
+lr.cm <- table(yhat, data$bluetarp)
+print(lr.cm)
+FP = lr.cm[1,2]
+FN = lr.cm[2,1]
+TP = lr.cm[2,2]
+TN = lr.cm[1,1]
+#get the accuracy precision FPR and FPR
+lr.acc = (TP + TN)/(FP + FN + TP + TN)
+lr.pre =  TP/(TP + FP)
+lr.tpr = TP/(TP+FN)
+lr.fpr = FP/(FP + TN)
+lr.auc = auc(as.numeric(data$bluetarp), as.numeric(yhat))
+
+```
+
+Threshold could be discussed here or within each model section above.
+
+# Results (Cross-Validation)
+
+## Performance Table
+
+| Model               | Tuning                                 | AUROC | Threshold  | Accuracy | TPR    | FPR    | Precision |
+|---------|---------|---------|---------|---------|---------|---------|---------|
+| Random Forest       | Ntree = 40,mtry = 3                    | 0.97  | NULL       | 0.9966   | 0.9623 | 0.0017 | 0.9433    |
+| Boosted Tree        | Ntree = 4, depth = 10                  | 0.954 | 0.1        | 0.994    | 0.917  | 0.0029 | 0.9099    |
+| SVM                 | cost = 400, gamma = 2, kernal = radial | 0.972 | 0.1        | 0.997    | 0.9625 | 0.0015 | 0.9530    |
+| Naive Bayes         | Nonparametric Bandwidth = 2            | 0.718 | NULL       | 0.977    | 0.691  | 0.016  | 0.5103858 |
+| LDA                 | NULL                                   | 0.896 | NULL(0.5)  | 0.983    | 0.725  | 0.006  | 0.801     |
+| QDA                 | NULL                                   | 0.896 | NULL(0.5)  | 0.995    | 0.990  | 0.005  | 0.840     |
+| Penalized Log Reg   | Lambd =0.0000055, alpha = 1            | 0.95  | 0.27052632 | 0.995    | 0.956  | 0.003  | 0.901     |
+| Logistic Regression | Lambd =0.00416                         | 0.779 | 0.2705     | 0.986    | 1      | 0.014  | 0.558     |
+| KNN | k = 5                         | 0.985 | NULL     | 0.997    | 0.966      | 0.00098  | 0.970     |
+
+## ROC Curves
+
+```{r ROC, warning=FALSE, message=FALSE}
+ #: get predictions
+train_prediction.RF =  predict(RF_Model,data = data[c("Red","Green","Blue")])
+pred.BT = predict(Boost_Model,data, type="response")
+train_prediction.BT = ifelse(pred.BT >= Boost_opt_threshold, 1L, 0L)
+
+pred[ind_eval] = predict(fit, data[ind_eval,], probability = TRUE) %>%
+attr("probabilities") %>% .[,"1"]
+yhat = ifelse(pred > .50, 1, 0) # hard classification
+train_prediction.SVM = yhat
+
+
+train_prediction.NB = predict(Naive_Bayes_Model,newdata= data[c("Red","Green","Blue")])
+
+LDA_Prediction = predict(LDA_Model,newdata= data[c("Red","Green","Blue")])
+train_prediction.LDA <- LDA_Prediction$class
+
+QDA_Prediction  = predict(QDA_Model,newdata= data[c("Red","Green","Blue")])
+train_prediction.QDA<- QDA_Prediction$class
+
+Enet.predict <-predict(Enet_Model,newx = as.matrix(data[c("Red","Green","Blue")]), type="response")
+train_prediction.Enet = ifelse(Enet.predict >= Enet.optThreshold, 1L, 0L)
+
+LR.predict = predict(LR_model,newx = as.matrix(data[c("Red","Green","Blue")]), type="response")
+train_prediction.LR= ifelse(LR.predict >= LR.optThreshold, 1L, 0L)
+pred_data = 
+  tibble(
+    enet = as.numeric(unlist(Enet.predict)),
+    logistic = as.numeric(unlist(LR.predict)),
+    linked = data$bluetarp %>% factor(levels=c(1,0)),
+    knn = as.numeric(unlist(KNN_Model)),
+    svm = as.numeric(pred),
+    random_forest =  as.numeric(unlist(train_prediction.RF)),
+    boosted_tree = as.numeric(unlist(pred.BT)),
+    Naive_Bayes = as.numeric(unlist(train_prediction.NB)),
+    LDA = as.numeric(unlist(LDA_Prediction$posterior[,2])),
+    QDA = as.numeric(unlist(QDA_Prediction$posterior[,2]))
+  ) %>%  # note: response must be a factor
+  # convert to long format 
+  gather(model, prediction, enet, logistic,knn,svm, random_forest,boosted_tree,Naive_Bayes,LDA,QDA) %>% 
+  # get performance for each model
+  group_by(model) %>% 
+  roc_curve(truth = linked, prediction)          # get ROC curve data
+  
+#: plot the ROC curve
+pred_data %>% 
+  ggplot(aes(1-specificity, sensitivity, color=model)) + 
+  geom_path() + 
+  geom_smooth(values=c(enet='black', logistic='brown4', knn ='cyan4',svm ='khaki3',random_forest = '#8B7B8B', boosted_tree = 'orange', Naive_BAYES = 'purple', LDA = 'palegreen2', QDA = '#7FFFD4'),size=3, span=0.8) +
+  scale_x_continuous(breaks=seq(0, 1, by=.2)) + 
+  scale_y_continuous(breaks=seq(0, 1, by=.2)) + labs(title ="ROC Curves")
+
+```
+
+# Conclusions
+
+In general, the performance of the four models is similar. As for the data I used, the proportion of positive and negative examples has reached over 1:10. Therefore, it is no longer meaningful to only look at the accuracy performance (if you keep taking samples and immediately classify them as not blue trap, you can get more than 90% accuracy classifier). Once we should pay more attention to TPR, FPR and percision. For humanitarian aid, our goal is to help as many victims as possible. When we have sufficient supplies and human resource, our philosophy is to find and treat all the victims. At this point, we need to reduce the case of False Negative generated by model prediction. This requires that the TPR of the model be high enough. At this time, it seems that the KNN model I trained is more satisfying. Its TPR is 96. Unfortunately, we didn't have enough resources at the time when the disaster happened. Therefore, we need to help the homeless as efficiently as possible. We should avoid waste of medical resources and manpower as much as possible. At this time, we need to choose a model with a lower FPR. At this point, logistic Regression seems to be the more appropriate model. It has the smallest FPR, although it also has the smallest TPR (which means we'll miss a lot of Blue TARP. But it avoids wasting resources. In general, KNN should be a perfect model among the models I have trained except for the two extreme cases mentioned above. 
+```{r warning=FALSE, message=FALSE}
+```
+## Conclusion #1 
+My model was trained from the haitiTrain.csv dataset. The performance of the model in this data set is far beyond my imagination. Percision is close to or above 90%. So they certainly help us quickly and accurately locate the blue TARP and deduce the location of the victims. But I don't think this result is so superior in the real world. The first is that even if we were able to locate the Blue Tarp accurately, there would not always be homeless people living under the Blue TARP. Locating people is only the first step in helping them. 
+```{r warning=FALSE, message=FALSE}
+```
+## Conclusion #2 
+I think this data fits well with the model we chose in part1. First of all, the characteristic dimension of the sample is not high and the correlation between the three dimensions and Class is very high. Each dimension in RGB is independent of each other. Therefore, we do not need to do too much pre-processing before training the model. Secondly, these models are not very suitable for multi-classification problems, especially for Logistic regression. If we need to use these models for multiple classifications, we may need to introduce SoftMax layer or use multiple classifiers to achieve this goal, which will undoubtedly reduce accuracy. But for this problem, we only need to find the Blue TARP which means we only need to deal with binary classification. These relatively simple classifiers can do the job on their own. And the third is that color blue is special enough in all the samples. As I showed in the EDA section, their location in RGB 3d space is very concentrated and linearly separable from other colors. Therefore, no matter we use KNN(which only pay attention on their neighbors), logistic Regression model which can only deal with linear problems, or SVM classifier which Because can be used in more classification scenarios thanks to the kernal function, we can all get good results. For these data, we can even visually find a plane to separate the two types of data. So it's definitely not too difficult for a classifier. 
+```{r warning=FALSE, message=FALSE}
+```
+## Conclusion #3 
+In the confuse matrix predicted by several of my models, more errors occur in False Negitave. This means that many of the blue sheds photographed in RBG maps have deviated from their original color. This may be due to other factors. Like the angle of the sunshine, or the weather. Maybe we can add new dimensions to the feature of data, like the weather at the time of the photo, the time of day. This might improve the performance of the model.
+```{r warning=FALSE, message=FALSE}
+```
+
+```{r, echo=FALSE}
+# knitr::knit_exit()    # ignore everything after this
+## Uncomment the above line for Part I
+## You can remove this entire code chunk for Part II
+```
+
+**ADDITIONAL SECTIONS FOR PART II:**
+
+# Hold-out Data / EDA
+
+# Load Hold-out Data
+
+Load hold-out data, explore data, etc.
+
+```{r Read_hold_out_data, warning=FALSE, message=FALSE}
+ortho057_noblue = read_table("orthovnir057_ROI_NON_Blue_Tarps.txt",skip = 8, col_names = FALSE) %>% dplyr::select(Red = X8,Green = X9,Blue = X10) %>% mutate(bluetarp = 0, file ="057")
+
+ortho067_blue = read_table("orthovnir067_ROI_Blue_Tarps.txt",skip = 8, col_names = FALSE) %>% dplyr::select(Red = X8,Green = X9,Blue = X10) %>% mutate(bluetarp = 1, file ="067")
+
+ortho067_noblue = read_table("orthovnir067_ROI_NOT_Blue_Tarps.txt",skip = 8, col_names = FALSE) %>% dplyr::select(Red = X8,Green = X9,Blue = X10) %>% mutate(bluetarp = 0, file ="067")
+
+
+ortho069_noblue = read_table("orthovnir069_ROI_NOT_Blue_Tarps.txt",skip = 8, col_names = FALSE) %>% dplyr::select(Red = X8,Green = X9,Blue = X10) %>% mutate(bluetarp = 0, file ="069")
+
+ortho069_blue = read_table("orthovnir069_ROI_Blue_Tarps.txt",skip = 8, col_names = FALSE) %>% dplyr::select(Red = X8,Green = X9,Blue = X10) %>% mutate(bluetarp = 1, file ="069")
+hold_out_data = {}
+hold_out_data = rbind(ortho057_noblue,ortho067_blue)
+hold_out_data = rbind(hold_out_data,ortho067_noblue)
+hold_out_data = rbind(hold_out_data,ortho069_blue)
+
+hold_out_data = hold_out_data[sample(1:nrow(hold_out_data)), ]
+```
+
+## EDA of Hold-out Data
+
+```{r EDA, warning=FALSE, message=FALSE}
+head(hold_out_data,n=50)
+#-- The ratio of bluetarp and non-bluetarp
+ggplot(hold_out_data) + 
+  geom_bar(mapping = aes(x = bluetarp))
+
+plotData <- hold_out_data[1:65000,]
+plot_ly(x=plotData$Red, y=plotData$Green, z=plotData$Blue, type="scatter3d", mode="markers", color=plotData$bluetarp) %>% layout(autosize = F, width = 500, height = 500)
+```
+
+## Compare with Training Data
+
+```{r compare, warning=FALSE, message=FALSE}
+plot_ly(x=data$Red, y=data$Green, z=data$Blue, type="scatter3d", mode="markers", color=data$bluetarp) %>% layout(autosize = F, width = 500, height = 500)
+```
+
+It seems that the training data and hold out data has the same distribution. So we can expect that trained model still work \# Results (Hold-Out)
+
+## KNN
+
+For KNN we need to train a new model with the Optimal K.
+
+```{r predict_knn, warning=FALSE, message=FALSE}
+#knn
+
+hold_out_model.knn <- FNN::knn(train = scale(hold_out_data[c("Red","Green","Blue")]), 
+                test  = scale(hold_out_data[c("Red","Green","Blue")]),
+                cl    = hold_out_data$bluetarp,
+                k     = 7,
+                prob  = TRUE)
+hold_out_knn.cm = table(hold_out_model.knn, hold_out_data$bluetarp)
+print(hold_out_knn.cm)
+plot(hold_out_knn.cm)
+
+CM = hold_out_knn.cm
+FP = CM[1,2]
+FN = CM[2,1]
+TP = CM[2,2]
+TN = CM[1,1]
+#get the accuracy precision FPR and FPR
+hold_knn.acc = (TP + TN)/(FP + FN + TP + TN)
+hold_knn.pre =  TP/(TP + FP)
+hold_knn.tpr = TP/(TP+FN)
+hold_knn.fpr = FP/(FP + TN)
+hold_knn.auc = auc(as.numeric(hold_out_data$bluetarp), as.numeric(hold_out_model.knn))
+```
+
+## LR
+
+```{r predict_lr, warning=FALSE, message=FALSE}
+#
+Hold_LR.predict = predict(LR_model,newx = as.matrix(hold_out_data[c("Red","Green","Blue")]), type="response")
+hold_train_prediction.LR= ifelse(Hold_LR.predict >= LR.optThreshold, 1L, 0L)
+hold_out_lr.cm = table(hold_train_prediction.LR, hold_out_data$bluetarp)
+print(hold_out_lr.cm)
+plot(hold_out_lr.cm)
+
+CM = hold_out_lr.cm
+FP = CM[1,2]
+FN = CM[2,1]
+TP = CM[2,2]
+TN = CM[1,1]
+#get the accuracy precision FPR and FPR
+hold_lr.acc = (TP + TN)/(FP + FN + TP + TN)
+hold_lr.pre =  TP/(TP + FP)
+hold_lr.tpr = TP/(TP+FN)
+hold_lr.fpr = FP/(FP + TN)
+hold_lr.auc = auc(as.numeric(hold_out_data$bluetarp), as.numeric(hold_train_prediction.LR))
+
+```
+
+## Enet
+
+```{r predict_Enet, warning=FALSE, message=FALSE}
+#
+Hold_Enet.predict <-predict(Enet_Model,newx = as.matrix(hold_out_data[c("Red","Green","Blue")]), type="response")
+hold_train_prediction.Enet = ifelse(Hold_Enet.predict >= Enet.optThreshold, 1L, 0L)
+hold_out_enet.cm = table(hold_train_prediction.Enet, hold_out_data$bluetarp)
+print(hold_out_enet.cm)
+
+CM = hold_out_enet.cm 
+FP = CM[1,2]
+FN = CM[2,1]
+TP = CM[2,2]
+TN = CM[1,1]
+#get the accuracy precision FPR and FPR
+hold_Enet.acc = (TP + TN)/(FP + FN + TP + TN)
+hold_Enet.pre =  TP/(TP + FP)
+hold_Enet.tpr = TP/(TP+FN)
+hold_Enet.fpr = FP/(FP + TN)
+hold_Enet.auc = auc(as.numeric(hold_out_data$bluetarp), as.numeric(hold_train_prediction.Enet))
+
+```
+
+## SVM
+
+```{r predict_svm, warning=FALSE, message=FALSE}
+#
+Hold_pred = predict(fit, hold_out_data, probability = TRUE) %>%
+attr("probabilities") %>% .[,"1"]
+hold_train_prediction.SVM = ifelse(Hold_pred > .50, 1, 0) # hard classification
+hold_out_svm.cm = table(hold_train_prediction.SVM, hold_out_data$bluetarp)
+print(hold_out_svm.cm)
+plot(hold_out_svm.cm)
+
+CM = hold_out_svm.cm
+FP = CM[1,2]
+FN = CM[2,1]
+TP = CM[2,2]
+TN = CM[1,1]
+#get the accuracy precision FPR and FPR
+hold_svm.acc = (TP + TN)/(FP + FN + TP + TN)
+hold_svm.pre =  TP/(TP + FP)
+hold_svm.tpr = TP/(TP+FN)
+hold_svm.fpr = FP/(FP + TN)
+hold_svm.auc = auc(as.numeric(hold_out_data$bluetarp), as.numeric(hold_train_prediction.SVM))
+```
+
+## Naive Bayes
+
+```{r predict_nb, warning=FALSE, message=FALSE}
+hold_train_prediction.NB = predict(Naive_Bayes_Model,newdata= hold_out_data[c("Red","Green","Blue")])
+hold_out_nb.cm = table(hold_train_prediction.NB, hold_out_data$bluetarp)
+print(hold_out_nb.cm)
+plot(hold_out_nb.cm)
+
+CM = hold_out_nb.cm
+FP = CM[1,2]
+FN = CM[2,1]
+TP = CM[2,2]
+TN = CM[1,1]
+#get the accuracy precision FPR and FPR
+hold_nb.acc = (TP + TN)/(FP + FN + TP + TN)
+hold_nb.pre =  TP/(TP + FP)
+hold_nb.tpr = TP/(TP+FN)
+hold_nb.fpr = FP/(FP + TN)
+hold_nb.auc = auc(as.numeric(hold_out_data$bluetarp), as.numeric(hold_train_prediction.NB))
+
+```
+
+## LDA
+
+```{r predict_lda, warning=FALSE, message=FALSE}
+hold_LDA_Prediction = predict(LDA_Model,newdata= hold_out_data[c("Red","Green","Blue")])
+hold_train_prediction.LDA <- hold_LDA_Prediction$class
+hold_out_lda.cm = table(hold_train_prediction.LDA, hold_out_data$bluetarp)
+print(hold_out_lda.cm)
+plot(hold_out_lda.cm)
+
+CM = hold_out_lda.cm
+FP = CM[1,2]
+FN = CM[2,1]
+TP = CM[2,2]
+TN = CM[1,1]
+#get the accuracy precision FPR and FPR
+hold_lda.acc = (TP + TN)/(FP + FN + TP + TN)
+hold_lda.pre =  TP/(TP + FP)
+hold_lda.tpr = TP/(TP+FN)
+hold_lda.fpr = FP/(FP + TN)
+hold_lda.auc = auc(as.numeric(hold_out_data$bluetarp), as.numeric(hold_train_prediction.LDA))
+
+```
+
+## QDA
+
+```{r predict_qad, warning=FALSE, message=FALSE}
+hold_QDA_Prediction  = predict(QDA_Model,newdata= hold_out_data[c("Red","Green","Blue")])
+hold_train_prediction.QDA<- hold_QDA_Prediction$class
+hold_out_qda.cm = table(hold_train_prediction.QDA, hold_out_data$bluetarp)
+print(hold_out_qda.cm)
+plot(hold_out_qda.cm)
+
+CM = hold_out_qda.cm
+FP = CM[1,2]
+FN = CM[2,1]
+TP = CM[2,2]
+TN = CM[1,1]
+#get the accuracy precision FPR and FPR
+hold_qda.acc = (TP + TN)/(FP + FN + TP + TN)
+hold_qda.pre =  TP/(TP + FP)
+hold_qda.tpr = TP/(TP+FN)
+hold_qda.fpr = FP/(FP + TN)
+hold_qda.auc = auc(as.numeric(hold_out_data$bluetarp), as.numeric(hold_train_prediction.QDA))
+
+
+#
+```
+
+## BoostTree
+
+```{r predict_bt, warning=FALSE, message=FALSE}
+hold_pred.BT = predict(Boost_Model,hold_out_data, type="response")
+hold_train_prediction.BT = ifelse(hold_pred.BT >= Boost_opt_threshold, 1L, 0L)
+hold_out_bt.cm = table(hold_train_prediction.BT, hold_out_data$bluetarp)
+print(hold_out_bt.cm)
+plot(hold_out_bt.cm)
+
+CM = hold_out_bt.cm
+FP = CM[1,2]
+FN = CM[2,1]
+TP = CM[2,2]
+TN = CM[1,1]
+#get the accuracy precision FPR and FPR
+hold_bt.acc = (TP + TN)/(FP + FN + TP + TN)
+hold_bt.pre =  TP/(TP + FP)
+hold_bt.tpr = TP/(TP+FN)
+hold_bt.fpr = FP/(FP + TN)
+hold_bt.auc = auc(as.numeric(hold_out_data$bluetarp), as.numeric(hold_train_prediction.BT))
+#
+```
+
+## RandomForest
+
+```{r predict_rf, warning=FALSE, message=FALSE}
+#
+hold_train_prediction.RF =  predict(RF_Model,newdata = hold_out_data[c("Red","Green","Blue")])
+hold_out_rf.cm = table(hold_train_prediction.RF, hold_out_data$bluetarp)
+print(hold_out_rf.cm)
+plot(hold_out_rf.cm)
+
+CM = hold_out_rf.cm
+FP = CM[1,2]
+FN = CM[2,1]
+TP = CM[2,2]
+TN = CM[1,1]
+#get the accuracy precision FPR and FPR
+hold_rf.acc = (TP + TN)/(FP + FN + TP + TN)
+hold_rf.pre =  TP/(TP + FP)
+hold_rf.tpr = TP/(TP+FN)
+hold_rf.fpr = FP/(FP + TN)
+hold_rf.auc = auc(as.numeric(hold_out_data$bluetarp), as.numeric(hold_train_prediction.RF))
+```
+
+## Hold-out Performance Table
+
+| Model               | AUROC | Accuracy | TPR    | FPR      | Precision |
+|---------------------|-------|----------|--------|----------|-----------|
+| Random Forest       | 0.887 | 0.996    | 0.786  | 0.0019   | 0.774     |
+| Boosted Tree        | 0.961 | 0.995    | 0.680  | 0.0006   | 0.925     |
+| SVM                 | 0.785 | 0.993    | 0.638  | 0.0037   | 0.571     |
+| Naive Bayes         | 0.625 | 0.993    | 0.817  | 0.0065   | 0.253     |
+| LDA                 | 0.905 | 0.995    | 0.6765 | 0.0016   | 0.814     |
+| QDA                 | 0.858 | 0.997    | 0.9534 | 0.0024   | 0.715     |
+| Penalized Log Reg   | 0.993 | 0.996    | 0.722  | 0.000008 | 0.9899    |
+| Logistic Regression | 0.742 | 0.995    | 0.996  | 0.004    | 0.483     |
+| KNN | 0.99 | 0.999    | 0.983  | 0.00017    | 0.980     |
+
+# Final Conclusions
+
+Conclusions for part2: 
+## Conclusion #1 
+It seems that the SVM or KNN model performs the best in CV performance. SVM has more degrees of freedom in the training process and the characteristics of SVM make it less prone to overfitting. In hold-out data, because bluetrap accounts for a smaller proportion of all data, accuracy becomes less important. The overall performance of KNN is better in this case.It's AUROC,percision are both also to 1. 
+```{r warning=FALSE, message=FALSE}
+```
+## Conclusion #2 
+In the test of hold-out data. The FPR of KNN is only 0.0017, which means we have very little discipline to misjudge a location as a bluetarp. This is very important for humanitarian relief. Because our supplies are often insufficient during rescue. Locating refugee locations more efficiently and accurately means we can deploy supplies more efficiently without being disturbed by false results. Apart from that, other parameters of this model also performed well. Compared to Penalized Log Reg. He has a higher TPR. This means that it is also not possible for us to miss a lot of refugees. 
+```{r warning=FALSE, message=FALSE}
+```
+## Conclusion #3 
+The choice of model also depends on the specific situation. For example, when we have sufficient supplies and rescue forces, we want to avoid the FN situation. At this time Penalized Logistic Regression is still the best choice. When our supplies and rescue forces are insufficient, we should try to avoid the FP situation. At this time Logistic Regression is a very extreme choice. Although its overall performance is poor, it only classified 19 points that are not bluetarp as bluetarp. 
+```{r warning=FALSE, message=FALSE}
+```
+## Conclusion #4 
+Since the data is uneven accuracy is arguably the most useless data in the table. In contrast, AUROC can better represent the performance of the model. It basically aggregates the performance of the model at all threshold values. These metrics are also mutually exclusive in certain cases. For example, when the precision of our model is very high, it means that FP is a very small number. However for FPR(is equal to FP/(FP +FN). When we have a very small FP FPR will have a very large number less chance. TPR and percision also have a certain correlation. In some extreme cases (FN = TN) and the denominators of their expressions are both TP. At this point the values of the two metrics will be very close.
+```{r warning=FALSE, message=FALSE}
+```
+## Conclusion #5 
+In this project, we can draw a conclusion that sometimes accuracy is not very meaningful. Over 90% of the data we use is not bluetarp. Under such data, even if we predict all the data as not bluetarp, our model accuracy can still be higher than 95%. But that completely defeats the reason why we are building a model to make predictions. We should define the loss function at this time to reevaluate the performance of our model. In addition, we can also customize the weight of the loss function to make the model more aggressive in a certain direction. \### Conclusion #6 The best threshold depends on the objective of the model. The threshold is not a fixed number (I used to think it could always be set to 0.5). Through this project I think we should change the threshold size according to our needs. After defining the loss function, we can find the most suitable threshold for our application scenario by traversing all the possible thresholds. 
+```{r warning=FALSE, message=FALSE}
+```
+## Conclusion #7 
+Data mining is definitely not an easy task. At first I thought that finding bluetarp using RGB data would be a particularly easy task. Because blue is less likely to appear on land, the correlation between blue and bluetrap should be very high. Then the RGB data we used corresponds exactly to blue. It can be said that it will not be a difficult thing to build a model and classify with such a high correlation feature. But in the project we still need a lot of parameters in various models. These parameters also have a large impact on the model. Whether the data is balanced, the loss function we define, and what parameters are used to express the performance of the model. These are all factors we need to consider. Not to mention that in other problems we also need to do a lot of preprocessing on the data. For example, we need to drop some features that are irrelevant to prediction, or delete some repetitive features. So data mining is more than just feeding data into a function and getting a model.
+```{r warning=FALSE, message=FALSE}
+```
